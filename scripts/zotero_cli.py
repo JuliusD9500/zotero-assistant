@@ -509,6 +509,70 @@ def cmd_read_pdf(args: argparse.Namespace) -> dict[str, Any]:
   }
 
 
+def search_page_occurrences(page: Any, term: str) -> list[list[Any]]:
+  """Searches a PDF page for term and groups word/line boxes into clean occurrences.
+
+  Merges word-level rectangles on the same horizontal line (caused by justified
+  PDF text) into a single continuous line rectangle, and groups consecutive
+  wrapped lines of a multi-line phrase into a single occurrence list so that
+  `page.add_highlight_annot(occ_rects)` creates one unified highlight per match.
+  """
+  flags = getattr(pymupdf, "TEXT_DEHYPHENATE", 0)
+  raw_rects = page.search_for(term, flags=flags)
+  if not raw_rects:
+    raw_rects = page.search_for(term)
+  if not raw_rects:
+    alt_term = (
+        term.replace("’", "'") if "’" in term else term.replace("'", "’")
+    )
+    if alt_term != term:
+      raw_rects = page.search_for(alt_term, flags=flags) or page.search_for(
+          alt_term
+      )
+  if not raw_rects:
+    return []
+
+  target_char_len = len("".join(term.split()))
+  occurrences: list[list[Any]] = []
+  first_rect = pymupdf.Rect(raw_rects[0])
+  current_occ: list[Any] = [first_rect]
+  current_chars = len("".join(page.get_text("text", clip=first_rect).split()))
+
+  for r in raw_rects[1:]:
+    r = pymupdf.Rect(r)
+    r_chars = len("".join(page.get_text("text", clip=r).split()))
+    last = current_occ[-1]
+    line_height = max(last.height, r.height, 10.0)
+
+    if current_chars < target_char_len * 0.95:
+      # Same line -> merge into single continuous line rect
+      if (
+          abs(r.y0 - last.y0) <= max(3.0, line_height * 0.35)
+          and abs(r.y1 - last.y1) <= max(3.0, line_height * 0.35)
+          and -2.0 <= (r.x0 - last.x1) <= max(25.0, line_height * 2.5)
+      ):
+        current_occ[-1] = pymupdf.Rect(
+            min(last.x0, r.x0),
+            min(last.y0, r.y0),
+            max(last.x1, r.x1),
+            max(last.y1, r.y1),
+        )
+        current_chars += r_chars
+        continue
+      # Next line -> append as next line of the same occurrence
+      if 0 < (r.y0 - last.y0) <= line_height * 3.0:
+        current_occ.append(r)
+        current_chars += r_chars
+        continue
+
+    occurrences.append(current_occ)
+    current_occ = [r]
+    current_chars = r_chars
+
+  occurrences.append(current_occ)
+  return occurrences
+
+
 def validate_backup_dir(backup_dir: pathlib.Path) -> None:
   """Ensures --backup-dir is not in /tmp or /private/tmp."""
   resolved = str(backup_dir.resolve())
@@ -590,12 +654,12 @@ def cmd_highlight(args: argparse.Namespace) -> dict[str, Any]:
       if not (0 <= p_idx < len(doc)):
         continue
       page = doc[p_idx]
-      rects = page.search_for(term)
-      if not rects:
+      occurrences = search_page_occurrences(page, term)
+      if not occurrences:
         continue
-      target_rects = rects if all_occ else [rects[0]]
-      for r in target_rects:
-        annot = page.add_highlight_annot(r)
+      target_occs = occurrences if all_occ else [occurrences[0]]
+      for occ_rects in target_occs:
+        annot = page.add_highlight_annot(occ_rects)
         annot.set_colors(stroke=rgb)
         annot.set_info(title=author, content=comment)
         annot.update()
@@ -605,7 +669,8 @@ def cmd_highlight(args: argparse.Namespace) -> dict[str, Any]:
             "color": color_hex,
             "author": author,
             "comment": comment,
-            "rect": list(r),
+            "rect": list(annot.rect),
+            "lineRects": [list(r) for r in occ_rects],
         })
       found_any = True
       if not all_occ:
