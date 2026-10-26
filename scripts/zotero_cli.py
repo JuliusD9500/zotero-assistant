@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
 import sys
@@ -509,6 +510,30 @@ def cmd_read_pdf(args: argparse.Namespace) -> dict[str, Any]:
   }
 
 
+def find_raw_rects(page: Any, term: str) -> list[Any]:
+  """Finds raw bounding boxes for term, handling ligatures, quotes, and soft hyphens."""
+  flags = getattr(pymupdf, "TEXT_DEHYPHENATE", 0)
+  raw = page.search_for(term, flags=flags) or page.search_for(term)
+  if raw:
+    return raw
+  alt = term.replace("’", "'") if "’" in term else term.replace("'", "’")
+  if alt != term:
+    raw = page.search_for(alt, flags=flags) or page.search_for(alt)
+    if raw:
+      return raw
+  # Handle Unicode soft hyphens (\xad) across line breaks
+  page_text = page.get_text()
+  for m in re.finditer(r"(\w+)\xad\s*(\w+)", page_text):
+    joined = m.group(1) + m.group(2)
+    if joined in term:
+      idx = term.find(joined)
+      r1 = page.search_for(term[:idx] + m.group(1), flags=flags)
+      r2 = page.search_for(m.group(2) + term[idx + len(joined) :], flags=flags)
+      if r1 and r2:
+        return r1 + r2
+  return []
+
+
 def search_page_occurrences(page: Any, term: str) -> list[list[Any]]:
   """Searches a PDF page for term and groups word/line boxes into clean occurrences.
 
@@ -517,57 +542,49 @@ def search_page_occurrences(page: Any, term: str) -> list[list[Any]]:
   wrapped lines of a multi-line phrase into a single occurrence list so that
   `page.add_highlight_annot(occ_rects)` creates one unified highlight per match.
   """
-  flags = getattr(pymupdf, "TEXT_DEHYPHENATE", 0)
-  raw_rects = page.search_for(term, flags=flags)
-  if not raw_rects:
-    raw_rects = page.search_for(term)
-  if not raw_rects:
-    alt_term = (
-        term.replace("’", "'") if "’" in term else term.replace("'", "’")
-    )
-    if alt_term != term:
-      raw_rects = page.search_for(alt_term, flags=flags) or page.search_for(
-          alt_term
-      )
+  raw_rects = find_raw_rects(page, term)
   if not raw_rects:
     return []
 
-  target_char_len = len("".join(term.split()))
   occurrences: list[list[Any]] = []
   first_rect = pymupdf.Rect(raw_rects[0])
   current_occ: list[Any] = [first_rect]
-  current_chars = len("".join(page.get_text("text", clip=first_rect).split()))
+  current_width = first_rect.width
 
   for r in raw_rects[1:]:
     r = pymupdf.Rect(r)
-    r_chars = len("".join(page.get_text("text", clip=r).split()))
     last = current_occ[-1]
-    line_height = max(last.height, r.height, 10.0)
+    line_height = max(last.height, r.height, 9.0)
 
-    if current_chars < target_char_len * 0.95:
-      # Same line -> merge into single continuous line rect
-      if (
-          abs(r.y0 - last.y0) <= max(3.0, line_height * 0.35)
-          and abs(r.y1 - last.y1) <= max(3.0, line_height * 0.35)
-          and -2.0 <= (r.x0 - last.x1) <= max(25.0, line_height * 2.5)
-      ):
-        current_occ[-1] = pymupdf.Rect(
-            min(last.x0, r.x0),
-            min(last.y0, r.y0),
-            max(last.x1, r.x1),
-            max(last.y1, r.y1),
-        )
-        current_chars += r_chars
-        continue
-      # Next line -> append as next line of the same occurrence
-      if 0 < (r.y0 - last.y0) <= line_height * 3.0:
-        current_occ.append(r)
-        current_chars += r_chars
-        continue
+    # 1. Same horizontal line -> merge consecutive words into a continuous line rect
+    if (
+        abs(r.y0 - last.y0) <= max(3.0, line_height * 0.35)
+        and abs(r.y1 - last.y1) <= max(3.0, line_height * 0.35)
+        and -2.0 <= (r.x0 - last.x1) <= max(25.0, line_height * 2.5)
+        and current_width < 0.70 * line_height * len(term)
+    ):
+      current_occ[-1] = pymupdf.Rect(
+          min(last.x0, r.x0),
+          min(last.y0, r.y0),
+          max(last.x1, r.x1),
+          max(last.y1, r.y1),
+      )
+      current_width += r.width
+      continue
+
+    # 2. Next line -> wrap if current width has not yet covered the full term
+    if (
+        0 < (r.y0 - last.y0) <= line_height * 2.8
+        and r.x0 < last.x1
+        and current_width < 0.43 * line_height * len(term)
+    ):
+      current_occ.append(r)
+      current_width += r.width
+      continue
 
     occurrences.append(current_occ)
     current_occ = [r]
-    current_chars = r_chars
+    current_width = r.width
 
   occurrences.append(current_occ)
   return occurrences
